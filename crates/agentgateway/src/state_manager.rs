@@ -54,9 +54,10 @@ impl StateManager {
 				.with_watched_handler::<XdsAddress>(ADDRESS_TYPE, stores.clone().discovery.clone())
 				.with_watched_handler::<ADPResource>(ADP_TYPE, stores.clone().binds.clone())
 				// .with_watched_handler::<XdsAuthorization>(AUTHORIZATION_TYPE, state)
-				.build(xds_metrics, awaiting_ready),
+				.build(xds_metrics, awaiting_ready.clone()),
 			)
 		} else {
+			// No XDS server configured, mark ready immediately after loading local config
 			None
 		};
 		if let Some(cfg) = &config.local_config {
@@ -67,6 +68,10 @@ impl StateManager {
 				gateway: strng::format!("{}/{}", config.namespace, config.gateway),
 			};
 			local_client.run().await?;
+			// If not using XDS, notify readiness immediately after loading local config
+			if xds_client.is_none() {
+				let _ = awaiting_ready.send(());
+			}
 		}
 		Ok(Self { stores, xds_client })
 	}
