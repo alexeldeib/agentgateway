@@ -457,7 +457,6 @@ impl ExtProcInstance {
 									.unwrap()
 									.send(Ok((http::Request::default(), Some(resp))));
 								tx_chunkh.take();
-								response_sent = true;
 								break;
 							}
 							let Some(tx_chunk) = tx_chunkh.as_mut() else {
@@ -607,7 +606,6 @@ impl ExtProcInstance {
 									.unwrap()
 									.send(Ok((http::Response::default(), Some(resp))));
 								tx_chunkh.take();
-								response_sent = true;
 								break;
 							}
 							let Some(tx_chunk) = tx_chunkh.as_mut() else {
