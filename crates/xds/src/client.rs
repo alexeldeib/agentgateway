@@ -665,14 +665,16 @@ impl AdsClient {
 					if !self.types_to_expect.is_empty() {
 						received_type = Some(msg.type_url.clone())
 					}
-					if let XdsSignal::Ack = self.handle_stream_event(msg, &discovery_req_tx).await? {
-						if let Some(received_type) = received_type {
-							self.types_to_expect.remove(&received_type);
-							if self.types_to_expect.is_empty() {
-								mem::drop(mem::take(&mut self.block_ready));
-							}
+					self.handle_stream_event(msg, &discovery_req_tx).await?;
+					// Mark ready after receiving first response for each type, regardless of ACK/NACK.
+					// This allows the gateway to start serving traffic even if some policies have
+					// validation errors (they will be logged and skipped).
+					if let Some(received_type) = received_type {
+						self.types_to_expect.remove(&received_type);
+						if self.types_to_expect.is_empty() {
+							mem::drop(mem::take(&mut self.block_ready));
 						}
-					};
+					}
 				}
 			}
 		}
