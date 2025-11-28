@@ -175,11 +175,30 @@ impl ExtProcRequest {
 #[derive(Debug)]
 struct ExtProcInstance {
 	failure_mode: FailureMode,
+	cancel_token: tokio_util::sync::CancellationToken,
 	skipped: Arc<AtomicBool>,
 	tx_req: Sender<ProcessingRequest>,
 	rx_resp_for_request: Option<Receiver<ProcessingResponse>>,
 	rx_resp_for_response: Option<Receiver<ProcessingResponse>>,
+	// Track if we've completed the request/response cycle successfully
+	// to avoid cancelling tasks on normal completion
+	request_completed: bool,
+	response_completed: bool,
 }
+
+impl Drop for ExtProcInstance {
+	fn drop(&mut self) {
+		// Only cancel tasks if we didn't complete both request and response successfully.
+		// This handles the case where the client disconnects mid-request.
+		if !self.request_completed || !self.response_completed {
+			self.cancel_token.cancel();
+			trace!("ext_proc instance dropped before completion, cancelling tasks");
+		} else {
+			trace!("ext_proc instance dropped after successful completion");
+		}
+	}
+}
+
 
 impl ExtProcInstance {
 	fn new(
@@ -193,55 +212,105 @@ impl ExtProcInstance {
 		let (tx_req, rx_req) = tokio::sync::mpsc::channel(10);
 		let (tx_resp, mut rx_resp) = tokio::sync::mpsc::channel(10);
 		let req_stream = tokio_stream::wrappers::ReceiverStream::new(rx_req);
-		tokio::task::spawn(async move {
-			// Spawn a task to handle processing requests.
-			// Incoming requests get send to tx_req and will be piped through here.
-			let responses = match c.process(req_stream).await {
-				Ok(r) => r,
-				Err(e) => {
-					warn!(?failure_mode, "failed to initialize endpoint picker: {e:?}");
-					return;
-				},
-			};
-			trace!("initial stream established");
-			let mut responses = responses.into_inner();
-			while let Ok(Some(item)) = responses.message().await {
-				trace!("received response item {item:?}");
-				let _ = tx_resp.send(item).await;
-			}
-		});
-		let (tx_resp_for_request, rx_resp_for_request) = tokio::sync::mpsc::channel(1);
-		let (tx_resp_for_response, rx_resp_for_response) = tokio::sync::mpsc::channel(1);
-		tokio::task::spawn(async move {
-			while let Some(item) = rx_resp.recv().await {
-				trace!("received response item {item:?}");
-				match &item.response {
-					Some(processing_response::Response::ResponseBody(_))
-					| Some(processing_response::Response::ResponseHeaders(_))
-					| Some(processing_response::Response::ResponseTrailers(_)) => {
-						let _ = tx_resp_for_response.send(item).await;
+
+		// Create cancellation token for coordinating task shutdown
+		let cancel_token = tokio_util::sync::CancellationToken::new();
+
+		// Task 1: gRPC stream handler - processes bidirectional stream with ext_proc
+		tokio::task::spawn({
+			let cancel = cancel_token.child_token();
+			async move {
+				// Spawn a task to handle processing requests.
+				// Incoming requests get send to tx_req and will be piped through here.
+				let responses = match c.process(req_stream).await {
+					Ok(r) => r,
+					Err(e) => {
+						warn!(?failure_mode, "failed to initialize endpoint picker: {e:?}");
+						return;
 					},
-					Some(processing_response::Response::RequestBody(_))
-					| Some(processing_response::Response::RequestHeaders(_))
-					| Some(processing_response::Response::RequestTrailers(_)) => {
-						let _ = tx_resp_for_request.send(item).await;
-					},
-					Some(processing_response::Response::ImmediateResponse(_)) => {
-						// In this case we aren't sure which is going to handle things...
-						// Send to both
-						let _ = tx_resp_for_request.send(item.clone()).await;
-						let _ = tx_resp_for_response.send(item).await;
-					},
-					None => {},
+				};
+				trace!("initial stream established");
+				let mut responses = responses.into_inner();
+				loop {
+					tokio::select! {
+						_ = cancel.cancelled() => {
+							trace!("gRPC stream handler cancelled");
+							break;
+						}
+						result = responses.message() => {
+							match result {
+								Ok(Some(item)) => {
+									trace!("received response item {item:?}");
+									let _ = tx_resp.send(item).await;
+								}
+								Ok(None) => {
+									trace!("gRPC stream ended");
+									break;
+								}
+								Err(e) => {
+									warn!("gRPC stream error: {e:?}");
+									break;
+								}
+							}
+						}
+					}
 				}
 			}
 		});
+
+		let (tx_resp_for_request, rx_resp_for_request) = tokio::sync::mpsc::channel(1);
+		let (tx_resp_for_response, rx_resp_for_response) = tokio::sync::mpsc::channel(1);
+
+		// Task 2: Response router - dispatches responses to appropriate handlers
+		tokio::task::spawn({
+			let cancel = cancel_token.child_token();
+			async move {
+				loop {
+					tokio::select! {
+						_ = cancel.cancelled() => {
+							trace!("response router cancelled");
+							break;
+						}
+						item = rx_resp.recv() => {
+							let Some(item) = item else {
+								trace!("response channel closed");
+								break;
+							};
+							trace!("received response item {item:?}");
+							match &item.response {
+								Some(processing_response::Response::ResponseBody(_))
+								| Some(processing_response::Response::ResponseHeaders(_))
+								| Some(processing_response::Response::ResponseTrailers(_)) => {
+									let _ = tx_resp_for_response.send(item).await;
+								},
+								Some(processing_response::Response::RequestBody(_))
+								| Some(processing_response::Response::RequestHeaders(_))
+								| Some(processing_response::Response::RequestTrailers(_)) => {
+									let _ = tx_resp_for_request.send(item).await;
+								},
+								Some(processing_response::Response::ImmediateResponse(_)) => {
+									// In this case we aren't sure which is going to handle things...
+									// Send to both
+									let _ = tx_resp_for_request.send(item.clone()).await;
+									let _ = tx_resp_for_response.send(item).await;
+								},
+								None => {},
+							}
+						}
+					}
+				}
+			}
+		});
+
 		Self {
 			skipped: Default::default(),
 			failure_mode,
+			cancel_token,
 			tx_req,
 			rx_resp_for_request: Some(rx_resp_for_request),
 			rx_resp_for_response: Some(rx_resp_for_response),
+			request_completed: false,
+			response_completed: false,
 		}
 	}
 
@@ -282,39 +351,54 @@ impl ExtProcInstance {
 		// We will spin off a task that is going to pipe the body to the ext_proc server as we read it.
 		let tx = self.tx_req.clone();
 
+		// Task 3: Request body streamer - pipes request body to ext_proc
 		if had_body {
-			tokio::task::spawn(async move {
-				let mut stream = BodyStream::new(body);
-				while let Some(Ok(frame)) = stream.next().await {
-					let preq = if frame.is_data() {
-						let frame = frame.into_data().expect("already checked");
-						trace!("sending request body chunk...",);
-						processing_request(Request::RequestBody(HttpBody {
-							body: frame.into(),
-							end_of_stream: false,
-						}))
-					} else if frame.is_trailers() {
-						let frame = frame.into_trailers().expect("already checked");
-						processing_request(Request::RequestTrailers(HttpTrailers {
-							trailers: to_header_map(&frame),
-						}))
-					} else {
-						panic!("unknown type")
-					};
-					trace!("sending request body chunk...");
-					let Ok(()) = tx.send(preq).await else {
-						// TODO: on error here we need a way to signal to the outer task to fail fast
-						return;
-					};
-				}
-				// Now that the body is done, send end of stream
-				let preq = processing_request(Request::RequestBody(HttpBody {
-					body: Default::default(),
-					end_of_stream: true,
-				}));
-				let _ = tx.send(preq).await;
+			tokio::task::spawn({
+				let cancel = self.cancel_token.child_token();
+				async move {
+					let mut stream = BodyStream::new(body);
+					loop {
+						tokio::select! {
+							_ = cancel.cancelled() => {
+								trace!("request body streaming cancelled");
+								break;
+							}
+							frame = stream.next() => {
+								let Some(Ok(frame)) = frame else {
+									break;
+								};
+								let preq = if frame.is_data() {
+									let frame = frame.into_data().expect("already checked");
+									trace!("sending request body chunk...",);
+									processing_request(Request::RequestBody(HttpBody {
+										body: frame.into(),
+										end_of_stream: false,
+									}))
+								} else if frame.is_trailers() {
+									let frame = frame.into_trailers().expect("already checked");
+									processing_request(Request::RequestTrailers(HttpTrailers {
+										trailers: to_header_map(&frame),
+									}))
+								} else {
+									panic!("unknown type")
+								};
+								trace!("sending request body chunk...");
+								let Ok(()) = tx.send(preq).await else {
+									warn!("failed to send body chunk, ext_proc likely disconnected");
+									break;
+								};
+							}
+						}
+					}
+					// Now that the body is done, send end of stream
+					let preq = processing_request(Request::RequestBody(HttpBody {
+						body: Default::default(),
+						end_of_stream: true,
+					}));
+					let _ = tx.send(preq).await;
 
-				trace!("body request done");
+					trace!("body request done");
+				}
 			});
 		}
 		// Now we need to build the new body. This is going to be streamed in from the ext_proc server.
@@ -330,62 +414,84 @@ impl ExtProcInstance {
 			.expect("mutate_request called twice");
 		let failure_mode = self.failure_mode;
 		let skipped = self.skipped.clone();
-		tokio::task::spawn(async move {
-			let mut req = Some(req);
-			let mut tx_done = Some(tx_done);
-			let mut tx_chunkh = Some(tx_chunk);
-			loop {
-				// Loop through all the ext_proc responses and process them
-				let Some(presp) = rx.recv().await else {
-					trace!("done receiving request");
-					if failure_mode == FailureMode::FailOpen
-						&& let Some(req) = req.take()
-						&& let Some(tx_done) = tx_done.take()
-					{
-						trace!("fail open triggered");
-						skipped.store(true, Ordering::SeqCst);
-						let (parts, _) = req.into_parts();
-						let new_req = http::Request::from_parts(parts, http::Body::from(body_copy.unwrap()));
-						let _ = tx_done.send(Ok((new_req, None)));
-						tx_chunkh.take();
+
+		// Task 4: Request response handler - processes request mutation responses from ext_proc
+		tokio::task::spawn({
+			let cancel = self.cancel_token.child_token();
+			async move {
+				let mut req = Some(req);
+				let mut tx_done = Some(tx_done);
+				let mut tx_chunkh = Some(tx_chunk);
+				let mut response_sent = false;
+				loop {
+					tokio::select! {
+						_ = cancel.cancelled(), if !response_sent => {
+							trace!("request response handler cancelled");
+							// Only send error if we haven't sent a success response yet
+							if tx_done.is_some() {
+								let _ = tx_done.take().unwrap().send(Err(Error::ResponseDropped));
+								break;
+							}
+						}
+						presp = rx.recv() => {
+							// Loop through all the ext_proc responses and process them
+							let Some(presp) = presp else {
+								trace!("done receiving request");
+								if failure_mode == FailureMode::FailOpen
+									&& let Some(req) = req.take()
+									&& let Some(tx_done) = tx_done.take()
+								{
+									trace!("fail open triggered");
+									skipped.store(true, Ordering::SeqCst);
+									let (parts, _) = req.into_parts();
+									let new_req = http::Request::from_parts(parts, http::Body::from(body_copy.unwrap()));
+									let _ = tx_done.send(Ok((new_req, None)));
+									tx_chunkh.take();
+								}
+								break;
+							};
+							if let Some(resp) = to_immediate_response(&presp) {
+								trace!("got immediate response in request handler");
+								let _ = tx_done
+									.take()
+									.unwrap()
+									.send(Ok((http::Request::default(), Some(resp))));
+								tx_chunkh.take();
+								response_sent = true;
+								break;
+							}
+							let Some(tx_chunk) = tx_chunkh.as_mut() else {
+								break;
+							};
+							let r = handle_response_for_request_mutation(had_body, req.as_mut(), tx_chunk, presp).await;
+							match r {
+								Ok((headers_done, eos)) => {
+									if headers_done
+										&& let Some(req) = req.take()
+										&& let Some(tx_done) = tx_done.take()
+									{
+										trace!("request complete!");
+										let _ = tx_done.send(Ok((req, None)));
+										response_sent = true;
+									}
+									if eos || !had_body {
+										trace!("request EOS!");
+										tx_chunkh.take();
+									}
+								},
+								Err(e) => {
+									warn!("error {e:?}");
+									break;
+								},
+							}
+						}
 					}
-					return;
-				};
-				if let Some(resp) = to_immediate_response(&presp) {
-					trace!("got immediate response in request handler");
-					let _ = tx_done
-						.take()
-						.unwrap()
-						.send(Ok((http::Request::default(), Some(resp))));
-					tx_chunkh.take();
-					return;
-				}
-				let Some(tx_chunk) = tx_chunkh.as_mut() else {
-					return;
-				};
-				let r = handle_response_for_request_mutation(had_body, req.as_mut(), tx_chunk, presp).await;
-				match r {
-					Ok((headers_done, eos)) => {
-						if headers_done
-							&& let Some(req) = req.take()
-							&& let Some(tx_done) = tx_done.take()
-						{
-							trace!("request complete!");
-							let _ = tx_done.send(Ok((req, None)));
-						}
-						if eos || !had_body {
-							trace!("request EOS!");
-							tx_chunkh.take();
-						}
-					},
-					Err(e) => {
-						warn!("error {e:?}");
-						return;
-					},
 				}
 			}
 		});
-		rx_done.await.map_err(|_| Error::ResponseDropped)?
+		let result = rx_done.await.map_err(|_| Error::ResponseDropped)??;
+		self.request_completed = true;
+		Ok(result)
 	}
 	pub async fn mutate_response(
 		&mut self,
@@ -411,37 +517,52 @@ impl ExtProcInstance {
 		// We will spin off a task that is going to pipe the body to the ext_proc server as we read it.
 		let tx = self.tx_req.clone();
 
+		// Task 5: Response body streamer - pipes response body to ext_proc
 		if had_body {
-			tokio::task::spawn(async move {
-				let mut stream = BodyStream::new(body);
-				while let Some(Ok(frame)) = stream.next().await {
-					let preq = if frame.is_data() {
-						let frame = frame.into_data().expect("already checked");
-						processing_request(Request::ResponseBody(HttpBody {
-							body: frame.into(),
-							end_of_stream: false,
-						}))
-					} else if frame.is_trailers() {
-						let frame = frame.into_trailers().expect("already checked");
-						processing_request(Request::ResponseTrailers(HttpTrailers {
-							trailers: to_header_map(&frame),
-						}))
-					} else {
-						panic!("unknown type")
-					};
-					trace!("sending response body chunk...");
-					let Ok(()) = tx.send(preq).await else {
-						// TODO: on error here we need a way to signal to the outer task to fail fast
-						return;
-					};
+			tokio::task::spawn({
+				let cancel = self.cancel_token.child_token();
+				async move {
+					let mut stream = BodyStream::new(body);
+					loop {
+						tokio::select! {
+							_ = cancel.cancelled() => {
+								trace!("response body streaming cancelled");
+								break;
+							}
+							frame = stream.next() => {
+								let Some(Ok(frame)) = frame else {
+									break;
+								};
+								let preq = if frame.is_data() {
+									let frame = frame.into_data().expect("already checked");
+									processing_request(Request::ResponseBody(HttpBody {
+										body: frame.into(),
+										end_of_stream: false,
+									}))
+								} else if frame.is_trailers() {
+									let frame = frame.into_trailers().expect("already checked");
+									processing_request(Request::ResponseTrailers(HttpTrailers {
+										trailers: to_header_map(&frame),
+									}))
+								} else {
+									panic!("unknown type")
+								};
+								trace!("sending response body chunk...");
+								let Ok(()) = tx.send(preq).await else {
+									warn!("failed to send response body chunk, ext_proc likely disconnected");
+									break;
+								};
+							}
+						}
+					}
+					// Now that the body is done, send end of stream
+					let preq = processing_request(Request::ResponseBody(HttpBody {
+						body: Default::default(),
+						end_of_stream: true,
+					}));
+					let _ = tx.send(preq).await;
+					trace!("body response done");
 				}
-				// Now that the body is done, send end of stream
-				let preq = processing_request(Request::ResponseBody(HttpBody {
-					body: Default::default(),
-					end_of_stream: true,
-				}));
-				let _ = tx.send(preq).await;
-				trace!("body response done");
 			});
 		}
 		// Now we need to build the new body. This is going to be streamed in from the ext_proc server.
@@ -454,54 +575,75 @@ impl ExtProcInstance {
 			.rx_resp_for_response
 			.take()
 			.expect("mutate_request called twice");
-		tokio::task::spawn(async move {
-			let mut resp = Some(resp);
-			let mut tx_done = Some(tx_done);
-			let mut tx_chunkh = Some(tx_chunk);
-			loop {
-				// Loop through all the ext_proc responses and process them
-				let Some(presp) = rx.recv().await else {
-					trace!("done receiving response");
-					return;
-				};
-				if let Some(resp) = to_immediate_response(&presp) {
-					trace!("got immediate response in response handler");
-					let _ = tx_done
-						.take()
-						.unwrap()
-						.send(Ok((http::Response::default(), Some(resp))));
-					tx_chunkh.take();
-					return;
-				}
-				let Some(tx_chunk) = tx_chunkh.as_mut() else {
-					trace!("body done, skipping");
-					return;
-				};
-				let r =
-					handle_response_for_response_mutation(had_body, resp.as_mut(), tx_chunk, presp).await;
-				match r {
-					Ok((headers_done, eos)) => {
-						if headers_done
-							&& let Some(resp) = resp.take()
-							&& let Some(tx_done) = tx_done.take()
-						{
-							trace!("response complete!");
-							let _ = tx_done.send(Ok((resp, None)));
+
+		// Task 6: Response response handler - processes response mutation responses from ext_proc
+		tokio::task::spawn({
+			let cancel = self.cancel_token.child_token();
+			async move {
+				let mut resp = Some(resp);
+				let mut tx_done = Some(tx_done);
+				let mut tx_chunkh = Some(tx_chunk);
+				let mut response_sent = false;
+				loop {
+					tokio::select! {
+						_ = cancel.cancelled(), if !response_sent => {
+							trace!("response response handler cancelled");
+							// Only send error if we haven't sent a success response yet
+							if tx_done.is_some() {
+								let _ = tx_done.take().unwrap().send(Err(Error::ResponseDropped));
+								break;
+							}
 						}
-						if eos || !had_body {
-							trace!("response EOS!");
-							tx_chunkh.take();
+						presp = rx.recv() => {
+							// Loop through all the ext_proc responses and process them
+							let Some(presp) = presp else {
+								trace!("done receiving response");
+								break;
+							};
+							if let Some(resp) = to_immediate_response(&presp) {
+								trace!("got immediate response in response handler");
+								let _ = tx_done
+									.take()
+									.unwrap()
+									.send(Ok((http::Response::default(), Some(resp))));
+								tx_chunkh.take();
+								response_sent = true;
+								break;
+							}
+							let Some(tx_chunk) = tx_chunkh.as_mut() else {
+								trace!("body done, skipping");
+								break;
+							};
+							let r =
+								handle_response_for_response_mutation(had_body, resp.as_mut(), tx_chunk, presp).await;
+							match r {
+								Ok((headers_done, eos)) => {
+									if headers_done
+										&& let Some(resp) = resp.take()
+										&& let Some(tx_done) = tx_done.take()
+									{
+										trace!("response complete!");
+										let _ = tx_done.send(Ok((resp, None)));
+										response_sent = true;
+									}
+									if eos || !had_body {
+										trace!("response EOS!");
+										tx_chunkh.take();
+									}
+								},
+								Err(e) => {
+									warn!("error {e:?}");
+									break;
+								},
+							}
 						}
-					},
-					Err(e) => {
-						warn!("error {e:?}");
-						return;
-						// return tx_done.take().expect("must be called once").send(Err(e));
-					},
+					}
 				}
 			}
 		});
-		rx_done.await.map_err(|_| Error::ResponseDropped)?
+		let result = rx_done.await.map_err(|_| Error::ResponseDropped)??;
+		self.response_completed = true;
+		Ok(result)
 	}
 }
 
