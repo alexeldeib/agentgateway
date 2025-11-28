@@ -358,6 +358,12 @@ impl HTTPProxy {
 		let start = Instant::now();
 		let start_time = agent_core::telemetry::render_current_time();
 
+		// Extract the cancellation token for detecting client disconnects
+		let cancel_token = req
+			.extensions()
+			.get::<tokio_util::sync::CancellationToken>()
+			.cloned();
+
 		// Copy connection level attributes into request level attributes
 		connection.copy::<TCPConnectionInfo>(req.extensions_mut());
 		connection.copy::<TLSConnectionInfo>(req.extensions_mut());
@@ -390,6 +396,7 @@ impl HTTPProxy {
 				req,
 				log.as_mut().unwrap(),
 				&mut response_policies,
+				cancel_token,
 			)
 			.await;
 
@@ -449,6 +456,7 @@ impl HTTPProxy {
 		req: ::http::Request<Incoming>,
 		log: &mut RequestLog,
 		response_policies: &mut ResponsePolicies,
+		cancel_token: Option<tokio_util::sync::CancellationToken>,
 	) -> Result<Response, ProxyResponse> {
 		log.tls_info = connection.get::<TLSConnectionInfo>().cloned();
 		log.backend_protocol = Some(cel::BackendProtocol::http);
@@ -677,6 +685,7 @@ impl HTTPProxy {
 						backend_policies,
 						response_policies,
 						req,
+						cancel_token,
 					)
 					.await;
 			},
@@ -714,6 +723,7 @@ impl HTTPProxy {
 					backend_policies.clone(),
 					response_policies,
 					req,
+					cancel_token.clone(),
 				)
 				.await;
 			if last || !should_retry(&res, retries.as_ref().unwrap()) {
@@ -756,6 +766,7 @@ impl HTTPProxy {
 		backend_policies: BackendPolicies,
 		response_policies: &mut ResponsePolicies,
 		req: Request,
+		cancel_token: Option<tokio_util::sync::CancellationToken>,
 	) -> Result<Response, ProxyResponse> {
 		let call = make_backend_call(
 			self.inputs.clone(),
@@ -765,6 +776,7 @@ impl HTTPProxy {
 			req,
 			Some(log),
 			response_policies,
+			cancel_token,
 		)
 		.await?;
 
@@ -967,6 +979,7 @@ async fn make_backend_call(
 	mut req: Request,
 	mut log: Option<&mut RequestLog>,
 	response_policies: &mut ResponsePolicies,
+	cancel_token: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<Pin<Box<dyn Future<Output = Result<Response, ProxyError>> + Send>>, ProxyResponse> {
 	let policy_client = PolicyClient {
 		inputs: inputs.clone(),
@@ -1276,8 +1289,19 @@ async fn make_backend_call(
 		.map(|l| l.cel.cel_context.needs_llm_completion())
 		.unwrap_or_default();
 	let a2a_type = response_policies.a2a_type.clone();
+	let cancel = cancel_token;
 	Ok(Box::pin(async move {
-		let mut resp = upstream.call(call).await?;
+		// Race the upstream request against client cancellation
+		let mut resp = if let Some(cancel) = cancel {
+			tokio::select! {
+				_ = cancel.cancelled() => {
+					return Err(ProxyError::ClientCancelled);
+				}
+				result = upstream.call(call) => result?,
+			}
+		} else {
+			upstream.call(call).await?
+		};
 		a2a::apply_to_response(
 			backend_call.backend_policies.a2a.as_ref(),
 			a2a_type,
@@ -1719,6 +1743,7 @@ impl PolicyClient {
 				req,
 				None,
 				&mut Default::default(),
+				None,
 			)
 			.await
 			.map_err(ProxyResponse::downcast)?

@@ -59,6 +59,7 @@ impl ProxyResponse {
 			ProxyError::RateLimitFailed | ProxyError::RateLimitExceeded { .. } => {
 				ProxyResponseReason::RateLimit
 			},
+			ProxyError::ClientCancelled => ProxyResponseReason::ClientDisconnected,
 		}
 	}
 	pub fn downcast(self) -> ProxyError {
@@ -101,6 +102,8 @@ pub enum ProxyResponseReason {
 	RateLimit,
 	/// The upstream request failed
 	UpstreamFailure,
+	/// Client disconnected before response was sent
+	ClientDisconnected,
 }
 
 impl Display for ProxyResponseReason {
@@ -145,6 +148,8 @@ pub enum ProxyError {
 	ExternalAuthorizationFailed(Option<StatusCode>),
 	#[error("authorization failed")]
 	AuthorizationFailed,
+	#[error("client cancelled request")]
+	ClientCancelled,
 	#[error("backend authentication failed: {0}")]
 	BackendAuthenticationFailed(anyhow::Error),
 	#[error("upstream call failed: {0}")]
@@ -220,6 +225,9 @@ impl ProxyError {
 			ProxyError::ProcessingString(_) => StatusCode::SERVICE_UNAVAILABLE,
 			ProxyError::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
 			ProxyError::RateLimitFailed => StatusCode::TOO_MANY_REQUESTS,
+
+			// Client disconnected before response could be sent
+			ProxyError::ClientCancelled => StatusCode::from_u16(499).unwrap(), // Client Closed Request
 
 			// Shouldn't happen on this path
 			ProxyError::UpstreamTCPCallFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,

@@ -419,14 +419,21 @@ impl Gateway {
 			.map(|h| h.max_buffer_size)
 			.unwrap_or(def.max_buffer_size);
 
+		// Create a cancellation token that will be triggered when the connection closes
+		// This allows in-flight requests to abort immediately when the client disconnects
+		let cancel_token = tokio_util::sync::CancellationToken::new();
+		let cancel_token_for_close = cancel_token.clone();
+
 		let serve = server.serve_connection_with_upgrades(
 			TokioIo::new(stream),
 			hyper::service::service_fn(move |mut req| {
 				let proxy = proxy.clone();
 				let connection = connection.clone();
 				let policies = policies.clone();
+				let cancel = cancel_token.clone();
 
 				req.extensions_mut().insert(BufferLimit::new(buffer));
+				req.extensions_mut().insert(cancel);
 				async move {
 					proxy
 						.proxy(connection, &policies, req)
@@ -438,6 +445,8 @@ impl Gateway {
 		// Wrap it in the graceful watcher, will ensure GOAWAY/Connect:clone when we shutdown
 		let serve = drain.wrap_connection(serve);
 		let res = serve.await;
+		// When the connection closes (client disconnect or completion), cancel all in-flight requests
+		cancel_token_for_close.cancel();
 		match res {
 			Ok(_) => Ok(()),
 			Err(e) => {
