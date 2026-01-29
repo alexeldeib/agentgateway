@@ -322,17 +322,19 @@ where
 			extra.set(res.extensions_mut());
 		}
 
-		// If pooled is HTTP/2, we can toss this reference immediately.
-		//
-		// when pooled is dropped, it will try to insert back into the
-		// pool. To delay that, spawn a future that completes once the
-		// sender is ready again.
+		// When pooled is dropped, it will try to insert back into the pool.
+		// To delay that, spawn a future that completes once the sender is ready again.
 		//
 		// This *should* only be once the related `Connection` has polled
 		// for a new request to start.
 		//
+		// For HTTP/2, we now properly check readiness via poll_ready() which
+		// returns Pending when at stream limit. This ensures HTTP/2 connections
+		// aren't re-inserted to the pool until they have capacity for new streams,
+		// enabling proper backpressure instead of queueing inside h2.
+		//
 		// It won't be ready if there is a body to stream.
-		if pooled.is_http2() || !pooled.is_pool_enabled() || pooled.is_ready() {
+		if !pooled.is_pool_enabled() || pooled.is_ready() {
 			drop(pooled);
 		} else if !res.body().is_end_stream() {
 			// let (delayed_tx, delayed_rx) = oneshot::channel::<()>();
@@ -780,13 +782,16 @@ enum PoolTx<B> {
 impl<B> PoolClient<B> {
 	fn poll_ready(
 		&mut self,
-		#[allow(unused_variables)] cx: &mut task::Context<'_>,
+		cx: &mut task::Context<'_>,
 	) -> Poll<Result<(), Error>> {
 		match self.tx {
 			#[cfg(feature = "http1")]
 			PoolTx::Http1(ref mut tx) => tx.poll_ready(cx).map_err(Error::closed),
 			#[cfg(feature = "http2")]
-			PoolTx::Http2(_) => Poll::Ready(Ok(())),
+			// Actually poll the h2 sender for readiness. This returns Pending when
+			// the connection is at its stream limit (SETTINGS_MAX_CONCURRENT_STREAMS),
+			// enabling proper backpressure instead of queueing inside h2.
+			PoolTx::Http2(ref mut tx) => tx.poll_ready(cx).map_err(Error::closed),
 		}
 	}
 
