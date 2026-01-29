@@ -148,6 +148,11 @@ pub struct BackendConfig {
 	/// If unset, there is no limit
 	#[serde(default)]
 	pool_max_size: Option<usize>,
+	/// The maximum number of concurrent HTTP/2 checkouts (in-flight requests) per connection.
+	/// This provides backpressure when a connection hits its stream limit.
+	/// Default is 100. Set lower to open new connections sooner.
+	#[serde(default = "defaults::pool_max_h2_checkouts")]
+	pool_max_h2_checkouts: usize,
 }
 
 impl Default for BackendConfig {
@@ -157,6 +162,7 @@ impl Default for BackendConfig {
 			connect_timeout: defaults::connect_timeout(),
 			pool_idle_timeout: defaults::pool_idle_timeout(),
 			pool_max_size: None,
+			pool_max_h2_checkouts: defaults::pool_max_h2_checkouts(),
 		}
 	}
 }
@@ -181,6 +187,9 @@ mod defaults {
 	pub fn http1_idle_timeout() -> Duration {
 		// Default to 10 minutes
 		Duration::from_secs(60 * 10)
+	}
+	pub fn pool_max_h2_checkouts() -> usize {
+		100
 	}
 }
 

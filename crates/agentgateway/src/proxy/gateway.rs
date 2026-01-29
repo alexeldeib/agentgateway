@@ -853,6 +853,7 @@ pub fn auto_server(c: Option<&frontend::HTTP>) -> auto::Builder<::hyper_util::rt
 		http2_frame_size,
 		http2_keepalive_interval,
 		http2_keepalive_timeout,
+		http2_max_concurrent_streams,
 	} = c.unwrap_or(&def);
 
 	if let Some(m) = http1_max_headers {
@@ -878,6 +879,10 @@ pub fn auto_server(c: Option<&frontend::HTTP>) -> auto::Builder<::hyper_util::rt
 	if let Some(m) = http2_frame_size {
 		b.http2().max_frame_size(*m);
 	}
+
+	// Configure max concurrent streams per HTTP/2 connection.
+	// Default is None (unlimited) instead of hyper's default of 200.
+	b.http2().max_concurrent_streams(*http2_max_concurrent_streams);
 
 	b
 }

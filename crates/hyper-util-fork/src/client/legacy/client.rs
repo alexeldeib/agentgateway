@@ -8,6 +8,8 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{self, Poll};
 use std::time::Duration;
 
@@ -322,17 +324,19 @@ where
 			extra.set(res.extensions_mut());
 		}
 
-		// If pooled is HTTP/2, we can toss this reference immediately.
-		//
-		// when pooled is dropped, it will try to insert back into the
-		// pool. To delay that, spawn a future that completes once the
-		// sender is ready again.
+		// When pooled is dropped, it will try to insert back into the pool.
+		// To delay that, spawn a future that completes once the sender is ready again.
 		//
 		// This *should* only be once the related `Connection` has polled
 		// for a new request to start.
 		//
+		// For HTTP/2, we now properly check readiness via poll_ready() which
+		// returns Pending when at stream limit. This ensures HTTP/2 connections
+		// aren't re-inserted to the pool until they have capacity for new streams,
+		// enabling proper backpressure instead of queueing inside h2.
+		//
 		// It won't be ready if there is a body to stream.
-		if pooled.is_http2() || !pooled.is_pool_enabled() || pooled.is_ready() {
+		if !pooled.is_pool_enabled() || pooled.is_ready() {
 			drop(pooled);
 		} else if !res.body().is_end_stream() {
 			// let (delayed_tx, delayed_rx) = oneshot::channel::<()>();
@@ -659,11 +663,23 @@ where
 								}
 							};
 
+							// Initialize checkout state for HTTP/2 connections
+							let h2_checkout_state = match &tx {
+								#[cfg(feature = "http2")]
+								PoolTx::Http2(_) => Some(Arc::new(H2CheckoutState {
+									counter: Arc::new(AtomicUsize::new(0)),
+									max_checkouts: pool.max_h2_checkouts(),
+								})),
+								#[cfg(feature = "http1")]
+								PoolTx::Http1(_) => None,
+							};
+
 							Ok(pool.pooled(
 								connecting,
 								PoolClient {
 									conn_info: connected,
 									tx,
+									h2_checkout_state,
 								},
 							))
 						}))
@@ -765,9 +781,19 @@ impl Future for ResponseFuture {
 
 // FIXME: allow() required due to `impl Trait` leaking types to this lint
 #[allow(missing_debug_implementations)]
+/// Shared state for HTTP/2 checkout limiting.
+/// The counter is in a separate Arc so pool.rs can increment/decrement it.
+struct H2CheckoutState {
+	counter: Arc<AtomicUsize>,
+	max_checkouts: usize,
+}
+
 struct PoolClient<B> {
 	conn_info: Connected,
 	tx: PoolTx<B>,
+	// Shared state for HTTP/2 checkout limiting (counter + configurable max)
+	// This tracks how many checkouts are in flight to prevent unbounded queueing
+	h2_checkout_state: Option<Arc<H2CheckoutState>>,
 }
 
 enum PoolTx<B> {
@@ -780,13 +806,50 @@ enum PoolTx<B> {
 impl<B> PoolClient<B> {
 	fn poll_ready(
 		&mut self,
-		#[allow(unused_variables)] cx: &mut task::Context<'_>,
+		cx: &mut task::Context<'_>,
 	) -> Poll<Result<(), Error>> {
 		match self.tx {
 			#[cfg(feature = "http1")]
 			PoolTx::Http1(ref mut tx) => tx.poll_ready(cx).map_err(Error::closed),
 			#[cfg(feature = "http2")]
-			PoolTx::Http2(_) => Poll::Ready(Ok(())),
+			// Actually poll the h2 sender for readiness. This returns Pending when
+			// the connection is at its stream limit (SETTINGS_MAX_CONCURRENT_STREAMS),
+			// enabling proper backpressure instead of queueing inside h2.
+			PoolTx::Http2(ref mut tx) => tx.poll_ready(cx).map_err(Error::closed),
+		}
+	}
+
+	/// Check if the connection has capacity for new streams using a sync poll.
+	/// For HTTP/2, this checks both the checkout counter and poll_ready.
+	/// Returns true if the connection can accept new requests.
+	fn has_capacity(&mut self) -> bool {
+		match self.tx {
+			#[cfg(feature = "http1")]
+			PoolTx::Http1(_) => true, // HTTP/1 capacity is handled differently
+			#[cfg(feature = "http2")]
+			PoolTx::Http2(ref mut tx) => {
+				// First check our checkout counter to limit concurrent checkouts
+				// This prevents the race condition where multiple checkouts happen
+				// before any streams are actually opened
+				if let Some(ref state) = self.h2_checkout_state {
+					let current = state.counter.load(Ordering::SeqCst);
+					if current >= state.max_checkouts {
+						trace!("HTTP/2 checkout limit reached: {} >= {}", current, state.max_checkouts);
+						return false;
+					}
+				}
+
+				// Also check h2's poll_ready for the stream limit
+				use std::task::{Context, Poll, Waker};
+				let waker = Waker::noop();
+				let mut cx = Context::from_waker(&waker);
+
+				match tx.poll_ready(&mut cx) {
+					Poll::Ready(Ok(())) => true,
+					Poll::Ready(Err(_)) => false, // Connection error
+					Poll::Pending => false, // At stream limit
+				}
+			},
 		}
 	}
 
@@ -857,22 +920,46 @@ where
 		!self.is_poisoned() && self.is_ready()
 	}
 
+	/// Check if the connection is open and has capacity for new streams.
+	/// For HTTP/2, this includes checking stream limits via poll_ready().
+	fn is_open_with_capacity(&mut self) -> bool {
+		if self.is_poisoned() {
+			return false;
+		}
+		#[cfg(feature = "http2")]
+		if self.is_http2() {
+			return self.has_capacity();
+		}
+		self.is_ready()
+	}
+
 	fn reserve(self) -> pool::Reservation<Self> {
 		match self.tx {
 			#[cfg(feature = "http1")]
 			PoolTx::Http1(tx) => pool::Reservation::Unique(PoolClient {
 				conn_info: self.conn_info,
 				tx: PoolTx::Http1(tx),
+				h2_checkout_state: None,
 			}),
 			#[cfg(feature = "http2")]
 			PoolTx::Http2(tx) => {
+				// Get or create the checkout state (shared between clones)
+				// The state should already exist from when the connection was first pooled
+				let state = self.h2_checkout_state
+					.unwrap_or_else(|| Arc::new(H2CheckoutState {
+						counter: Arc::new(AtomicUsize::new(0)),
+						max_checkouts: 100, // Fallback default
+					}));
+
 				let b = PoolClient {
 					conn_info: self.conn_info.clone(),
 					tx: PoolTx::Http2(tx.clone()),
+					h2_checkout_state: Some(state.clone()),
 				};
 				let a = PoolClient {
 					conn_info: self.conn_info,
 					tx: PoolTx::Http2(tx),
+					h2_checkout_state: Some(state),
 				};
 				pool::Reservation::Shared(a, b)
 			},
@@ -881,6 +968,11 @@ where
 
 	fn can_share(&self) -> bool {
 		self.is_http2()
+	}
+
+	fn checkout_counter(&self) -> Option<Arc<AtomicUsize>> {
+		// Return the counter Arc from the state for pool.rs to increment/decrement
+		self.h2_checkout_state.as_ref().map(|state| state.counter.clone())
 	}
 }
 
@@ -1007,6 +1099,7 @@ impl Builder {
 			pool_config: pool::Config {
 				idle_timeout: Some(Duration::from_secs(90)),
 				max_idle_per_host: usize::MAX,
+				max_h2_checkouts: 100,
 			},
 			pool_timer: None,
 		}
@@ -1056,6 +1149,18 @@ impl Builder {
 	/// Default is `usize::MAX` (no limit).
 	pub fn pool_max_idle_per_host(&mut self, max_idle: usize) -> &mut Self {
 		self.pool_config.max_idle_per_host = max_idle;
+		self
+	}
+
+	/// Sets the maximum concurrent HTTP/2 checkouts per connection.
+	///
+	/// This provides backpressure when a connection hits its stream limit
+	/// (SETTINGS_MAX_CONCURRENT_STREAMS). When the checkout count reaches
+	/// this limit, the pool will open new connections instead of queueing.
+	///
+	/// Default is `100`.
+	pub fn pool_max_h2_checkouts(&mut self, max: usize) -> &mut Self {
+		self.pool_config.max_h2_checkouts = max;
 		self
 	}
 

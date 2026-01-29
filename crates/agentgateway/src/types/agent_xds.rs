@@ -1546,6 +1546,8 @@ impl TryFrom<&proto::agent::FrontendPolicySpec> for FrontendPolicy {
 				http2_frame_size: h.http2_frame_size,
 				http2_keepalive_interval: h.http2_keepalive_interval.map(convert_duration),
 				http2_keepalive_timeout: h.http2_keepalive_timeout.map(convert_duration),
+				// Default to None (unlimited) - not configurable via XDS yet
+				http2_max_concurrent_streams: None,
 			}),
 			Some(fps::Kind::Tls(t)) => FrontendPolicy::TLS(frontend::TLS {
 				handshake_timeout: t

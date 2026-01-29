@@ -55,6 +55,11 @@ pub struct HTTP {
 	#[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
 	#[serde(default)]
 	pub http2_keepalive_timeout: Option<Duration>,
+	/// The maximum number of concurrent streams allowed per HTTP/2 connection.
+	/// If None (default), there is no limit. Hyper's default is 200.
+	/// Set to None to allow unlimited concurrent streams, or a specific value to limit.
+	#[serde(default)]
+	pub http2_max_concurrent_streams: Option<u32>,
 }
 
 impl Default for HTTP {
@@ -71,6 +76,8 @@ impl Default for HTTP {
 
 			http2_keepalive_interval: None,
 			http2_keepalive_timeout: None,
+			// Default to None (unlimited) to avoid server-side backpressure
+			http2_max_concurrent_streams: None,
 		}
 	}
 }

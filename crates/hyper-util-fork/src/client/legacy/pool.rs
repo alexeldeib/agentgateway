@@ -8,6 +8,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{self, Poll};
 use std::time::{Duration, Instant};
@@ -40,6 +41,12 @@ pub trait Poolable: Unpin + Send + Sized + 'static {
 	/// Allows for HTTP/2 to return a shared reservation.
 	fn reserve(self) -> Reservation<Self>;
 	fn can_share(&self) -> bool;
+	/// Check if the connection is open and has capacity for new streams.
+	/// For HTTP/2, this should check if the connection is at its stream limit.
+	/// Default implementation just calls is_open().
+	fn is_open_with_capacity(&mut self) -> bool { self.is_open() }
+	/// Get the checkout counter for HTTP/2 connections (None for HTTP/1)
+	fn checkout_counter(&self) -> Option<Arc<AtomicUsize>> { None }
 }
 
 pub trait Key: Eq + Hash + Clone + Debug + Unpin + Send + Sync + 'static {}
@@ -81,6 +88,8 @@ struct PoolInner<T, K: Eq + Hash> {
 	// state, waiting to receive a new Request to send on the socket.
 	idle: HashMap<K, Vec<Idle<T>>>,
 	max_idle_per_host: usize,
+	// Maximum concurrent HTTP/2 checkouts per connection
+	max_h2_checkouts: usize,
 	// These are outstanding Checkouts that are waiting for a socket to be
 	// able to send a Request one. This is used when "racing" for a new
 	// connection.
@@ -107,6 +116,9 @@ struct WeakOpt<T>(Option<Weak<T>>);
 pub struct Config {
 	pub idle_timeout: Option<Duration>,
 	pub max_idle_per_host: usize,
+	/// Maximum concurrent HTTP/2 checkouts per connection before backpressure kicks in.
+	/// Default is 100.
+	pub max_h2_checkouts: usize,
 }
 
 impl Config {
@@ -129,6 +141,7 @@ impl<T, K: Key> Pool<T, K> {
 				idle: HashMap::new(),
 				idle_interval_ref: None,
 				max_idle_per_host: config.max_idle_per_host,
+				max_h2_checkouts: config.max_h2_checkouts,
 				waiters: HashMap::new(),
 				exec,
 				timer,
@@ -143,6 +156,14 @@ impl<T, K: Key> Pool<T, K> {
 
 	pub(crate) fn is_enabled(&self) -> bool {
 		self.inner.is_some()
+	}
+
+	/// Returns the maximum HTTP/2 checkouts per connection configured for this pool.
+	pub(crate) fn max_h2_checkouts(&self) -> usize {
+		self.inner
+			.as_ref()
+			.map(|inner| inner.lock().unwrap().max_h2_checkouts)
+			.unwrap_or(100) // Default if pool disabled
 	}
 
 	#[cfg(test)]
@@ -221,7 +242,13 @@ impl<T: Poolable, K: Key> Pool<T, K> {
 		&self,
 		#[cfg_attr(not(feature = "http2"), allow(unused_mut))] mut connecting: Connecting<T, K>,
 		value: T,
-	) -> Pooled<T, K> {
+	) -> Pooled<T, K>
+	where
+		T: Poolable,
+	{
+		// Get checkout counter before we move the value
+		let checkout_counter = value.checkout_counter();
+
 		let (value, pool_ref) = if let Some(ref enabled) = self.inner {
 			match value.reserve() {
 				#[cfg(feature = "http2")]
@@ -257,11 +284,18 @@ impl<T: Poolable, K: Key> Pool<T, K> {
 			key: connecting.key.clone(),
 			is_reused: false,
 			pool: pool_ref,
+			h2_checkout_counter: checkout_counter,
 			value: Some(value),
 		}
 	}
 
-	fn reuse(&self, key: &K, value: T) -> Pooled<T, K> {
+	fn reuse(&self, key: &K, value: T) -> Pooled<T, K>
+	where
+		T: Poolable,
+	{
+		// Get the checkout counter before moving value
+		let checkout_counter = value.checkout_counter();
+
 		debug!("reuse idle connection for {:?}", key);
 		// TODO: unhack this
 		// In Pool::pooled(), which is used for inserting brand new connections,
@@ -282,6 +316,7 @@ impl<T: Poolable, K: Key> Pool<T, K> {
 			is_reused: true,
 			key: key.clone(),
 			pool: pool_ref,
+			h2_checkout_counter: checkout_counter,
 			value: Some(value),
 		}
 	}
@@ -295,25 +330,49 @@ struct IdlePopper<'a, T, K> {
 
 impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
 	fn pop(self, expiration: &Expiration) -> Option<Idle<T>> {
+		// For HTTP/2, we may need to check multiple connections to find one with capacity.
+		// Collect at-capacity connections to put back after we're done searching.
+		let mut at_capacity: Vec<Idle<T>> = Vec::new();
+
 		while let Some(entry) = self.list.pop() {
 			// If the connection has been closed, or is older than our idle
-			// timeout, simply drop it and keep looking...
+			// timeout, simply drop it and keep looking.
 			if !entry.value.is_open() {
 				trace!("removing closed connection for {:?}", self.key);
 				continue;
 			}
-			// TODO: Actually, since the `idle` list is pushed to the end always,
-			// that would imply that if *this* entry is expired, then anything
-			// "earlier" in the list would *have* to be expired also... Right?
-			//
-			// In that case, we could just break out of the loop and drop the
-			// whole list...
 			if expiration.expires(entry.idle_at) {
 				trace!("removing expired connection for {:?}", self.key);
 				continue;
 			}
 
-			let value = match entry.value.reserve() {
+			let mut value_to_check = entry.value;
+
+			// For HTTP/2 connections, check if they have capacity for more streams.
+			// If at stream limit or too many checkouts, save it and continue checking others.
+			if value_to_check.can_share() && !value_to_check.is_open_with_capacity() {
+				debug!("HTTP/2 connection at capacity for {:?}, checking others", self.key);
+				at_capacity.push(Idle {
+					// Use fresh timestamp - connection is actively handling streams,
+					// not truly idle. Keeping the old timestamp would cause it to
+					// expire even while actively used.
+					idle_at: Instant::now(),
+					value: value_to_check,
+				});
+				continue;
+			}
+
+			// Found a connection with capacity! Put back the at-capacity ones first.
+			for conn in at_capacity {
+				self.list.push(conn);
+			}
+
+			// Increment the checkout counter BEFORE returning
+			if let Some(counter) = value_to_check.checkout_counter() {
+				counter.fetch_add(1, Ordering::SeqCst);
+			}
+
+			let value = match value_to_check.reserve() {
 				#[cfg(feature = "http2")]
 				Reservation::Shared(to_reinsert, to_checkout) => {
 					self.list.push(Idle {
@@ -331,15 +390,32 @@ impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
 			});
 		}
 
+		// No connection with capacity found. Put back all at-capacity connections.
+		for conn in at_capacity {
+			self.list.push(conn);
+		}
+
+		// Return None - this tells the caller no available connection exists,
+		// which will trigger creating a new HTTP/2 connection.
 		None
 	}
 }
 
 impl<T: Poolable, K: Key> PoolInner<T, K> {
 	fn put(&mut self, key: K, value: T, __pool_ref: &Arc<Mutex<PoolInner<T, K>>>) {
-		if value.can_share() && self.idle.contains_key(&key) {
-			trace!("put; existing idle HTTP/2 connection for {:?}", key);
-			return;
+		// For HTTP/2 connections (can_share=true), we now allow multiple connections
+		// to be pooled. This enables proper load distribution when connections are
+		// at their stream limit (SETTINGS_MAX_CONCURRENT_STREAMS).
+		if value.can_share() {
+			if let Some(list) = self.idle.get(&key) {
+				// Check if we already have too many idle HTTP/2 connections
+				// (limit to prevent unbounded growth)
+				const MAX_IDLE_H2_CONNECTIONS: usize = 8;
+				if list.len() >= MAX_IDLE_H2_CONNECTIONS {
+					trace!("put; HTTP/2 connection limit reached for {:?}, dropping", key);
+					return;
+				}
+			}
 		}
 		trace!("put; add idle connection for {:?}", key);
 		let mut remove_waiters = false;
@@ -505,6 +581,8 @@ pub struct Pooled<T: Poolable, K: Key> {
 	is_reused: bool,
 	key: K,
 	pool: WeakOpt<Mutex<PoolInner<T, K>>>,
+	// HTTP/2 checkout counter (decremented on drop)
+	h2_checkout_counter: Option<Arc<AtomicUsize>>,
 }
 
 impl<T: Poolable, K: Key> Pooled<T, K> {
@@ -540,6 +618,12 @@ impl<T: Poolable, K: Key> DerefMut for Pooled<T, K> {
 
 impl<T: Poolable, K: Key> Drop for Pooled<T, K> {
 	fn drop(&mut self) {
+		// Decrement HTTP/2 checkout counter
+		if let Some(ref counter) = self.h2_checkout_counter {
+			let prev = counter.fetch_sub(1, Ordering::SeqCst);
+			trace!("HTTP/2 checkout counter decremented: {} -> {}", prev, prev.saturating_sub(1));
+		}
+
 		if let Some(value) = self.value.take() {
 			if !value.is_open() {
 				// If we *already* know the connection is done here,
@@ -634,26 +718,23 @@ impl<T: Poolable, K: Key> Checkout<T, K> {
 		let entry = {
 			let mut inner = self.pool.inner.as_ref()?.lock().unwrap();
 			let expiration = Expiration::new(inner.timeout);
-			let maybe_entry = inner.idle.get_mut(&self.key).and_then(|list| {
+			// Get the entry and check list emptiness separately, since pop() may
+			// return None but leave the list non-empty (e.g., HTTP/2 at stream limit).
+			let (entry, empty) = if let Some(list) = inner.idle.get_mut(&self.key) {
 				trace!("take? {:?}: expiration = {:?}", self.key, expiration.0);
-				// A block to end the mutable borrow on list,
-				// so the map below can check is_empty()
-				{
-					let popper = IdlePopper {
-						key: &self.key,
-						list,
-					};
-					popper.pop(&expiration)
-				}
-				.map(|e| (e, list.is_empty()))
-			});
-
-			let (entry, empty) = if let Some((e, empty)) = maybe_entry {
-				(Some(e), empty)
+				let popper = IdlePopper {
+					key: &self.key,
+					list,
+				};
+				let entry = popper.pop(&expiration);
+				// Check emptiness AFTER pop, since pop may have pushed back
+				// at-capacity connections
+				let empty = list.is_empty();
+				(entry, empty)
 			} else {
-				// No entry found means nuke the list for sure.
 				(None, true)
 			};
+
 			if empty {
 				// TODO: This could be done with the HashMap::entry API instead.
 				inner.idle.remove(&self.key);
@@ -878,6 +959,7 @@ mod tests {
 			super::Config {
 				idle_timeout: Some(Duration::from_millis(100)),
 				max_idle_per_host: max_idle,
+				max_h2_checkouts: 100,
 			},
 			TokioExecutor::new(),
 			Option::<timer::Timer>::None,
@@ -978,6 +1060,7 @@ mod tests {
 			super::Config {
 				idle_timeout: Some(Duration::from_millis(10)),
 				max_idle_per_host: usize::MAX,
+				max_h2_checkouts: 100,
 			},
 			TokioExecutor::new(),
 			Some(TokioTimer::new()),
