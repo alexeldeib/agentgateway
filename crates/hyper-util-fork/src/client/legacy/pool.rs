@@ -40,6 +40,10 @@ pub trait Poolable: Unpin + Send + Sized + 'static {
 	/// Allows for HTTP/2 to return a shared reservation.
 	fn reserve(self) -> Reservation<Self>;
 	fn can_share(&self) -> bool;
+	/// Check if the connection is open and has capacity for new streams.
+	/// For HTTP/2, this should check if the connection is at its stream limit.
+	/// Default implementation just calls is_open().
+	fn is_open_with_capacity(&mut self) -> bool { self.is_open() }
 }
 
 pub trait Key: Eq + Hash + Clone + Debug + Unpin + Send + Sync + 'static {}
@@ -295,25 +299,41 @@ struct IdlePopper<'a, T, K> {
 
 impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
 	fn pop(self, expiration: &Expiration) -> Option<Idle<T>> {
+		// For HTTP/2, we may need to check multiple connections to find one with capacity.
+		// Collect at-capacity connections to put back after we're done searching.
+		let mut at_capacity: Vec<Idle<T>> = Vec::new();
+
 		while let Some(entry) = self.list.pop() {
 			// If the connection has been closed, or is older than our idle
-			// timeout, simply drop it and keep looking...
+			// timeout, simply drop it and keep looking.
 			if !entry.value.is_open() {
 				trace!("removing closed connection for {:?}", self.key);
 				continue;
 			}
-			// TODO: Actually, since the `idle` list is pushed to the end always,
-			// that would imply that if *this* entry is expired, then anything
-			// "earlier" in the list would *have* to be expired also... Right?
-			//
-			// In that case, we could just break out of the loop and drop the
-			// whole list...
 			if expiration.expires(entry.idle_at) {
 				trace!("removing expired connection for {:?}", self.key);
 				continue;
 			}
 
-			let value = match entry.value.reserve() {
+			let mut value_to_check = entry.value;
+
+			// For HTTP/2 connections, check if they have capacity for more streams.
+			// If at stream limit, save it and continue checking other connections.
+			if value_to_check.can_share() && !value_to_check.is_open_with_capacity() {
+				trace!("HTTP/2 connection at stream limit for {:?}, checking others", self.key);
+				at_capacity.push(Idle {
+					idle_at: entry.idle_at,
+					value: value_to_check,
+				});
+				continue;
+			}
+
+			// Found a connection with capacity! Put back the at-capacity ones first.
+			for conn in at_capacity {
+				self.list.push(conn);
+			}
+
+			let value = match value_to_check.reserve() {
 				#[cfg(feature = "http2")]
 				Reservation::Shared(to_reinsert, to_checkout) => {
 					self.list.push(Idle {
@@ -331,15 +351,33 @@ impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
 			});
 		}
 
+		// No connection with capacity found. Put back all at-capacity connections.
+		for conn in at_capacity {
+			self.list.push(conn);
+		}
+
+		// Return None - this tells the caller no available connection exists,
+		// which will trigger creating a new HTTP/2 connection.
 		None
 	}
 }
 
 impl<T: Poolable, K: Key> PoolInner<T, K> {
 	fn put(&mut self, key: K, value: T, __pool_ref: &Arc<Mutex<PoolInner<T, K>>>) {
-		if value.can_share() && self.idle.contains_key(&key) {
-			trace!("put; existing idle HTTP/2 connection for {:?}", key);
-			return;
+		// For HTTP/2 connections (can_share=true), we now allow multiple connections
+		// to be pooled. This enables proper load distribution when connections are
+		// at their stream limit (SETTINGS_MAX_CONCURRENT_STREAMS).
+		// Only skip if this exact connection instance is already in the pool.
+		if value.can_share() {
+			if let Some(list) = self.idle.get(&key) {
+				// Check if we already have too many idle HTTP/2 connections
+				// (limit to prevent unbounded growth)
+				const MAX_IDLE_H2_CONNECTIONS: usize = 8;
+				if list.len() >= MAX_IDLE_H2_CONNECTIONS {
+					trace!("put; HTTP/2 connection limit reached for {:?}, dropping", key);
+					return;
+				}
+			}
 		}
 		trace!("put; add idle connection for {:?}", key);
 		let mut remove_waiters = false;
@@ -634,26 +672,23 @@ impl<T: Poolable, K: Key> Checkout<T, K> {
 		let entry = {
 			let mut inner = self.pool.inner.as_ref()?.lock().unwrap();
 			let expiration = Expiration::new(inner.timeout);
-			let maybe_entry = inner.idle.get_mut(&self.key).and_then(|list| {
+			// Get the entry and check list emptiness separately, since pop() may
+			// return None but leave the list non-empty (e.g., HTTP/2 at stream limit).
+			let (entry, empty) = if let Some(list) = inner.idle.get_mut(&self.key) {
 				trace!("take? {:?}: expiration = {:?}", self.key, expiration.0);
-				// A block to end the mutable borrow on list,
-				// so the map below can check is_empty()
-				{
-					let popper = IdlePopper {
-						key: &self.key,
-						list,
-					};
-					popper.pop(&expiration)
-				}
-				.map(|e| (e, list.is_empty()))
-			});
-
-			let (entry, empty) = if let Some((e, empty)) = maybe_entry {
-				(Some(e), empty)
+				let popper = IdlePopper {
+					key: &self.key,
+					list,
+				};
+				let entry = popper.pop(&expiration);
+				// Check emptiness AFTER pop, since pop may have pushed back
+				// an at-capacity connection
+				let empty = list.is_empty();
+				(entry, empty)
 			} else {
-				// No entry found means nuke the list for sure.
 				(None, true)
 			};
+
 			if empty {
 				// TODO: This could be done with the HashMap::entry API instead.
 				inner.idle.remove(&self.key);

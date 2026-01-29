@@ -795,6 +795,30 @@ impl<B> PoolClient<B> {
 		}
 	}
 
+	/// Check if the connection has capacity for new streams using a sync poll.
+	/// For HTTP/2, this checks if the connection is at its stream limit.
+	/// Returns true if the connection can accept new requests.
+	fn has_capacity(&mut self) -> bool {
+		match self.tx {
+			#[cfg(feature = "http1")]
+			PoolTx::Http1(_) => true, // HTTP/1 capacity is handled differently
+			#[cfg(feature = "http2")]
+			PoolTx::Http2(ref mut tx) => {
+				// Use noop waker to do a sync poll check
+				use std::task::{Context, Poll, Waker};
+
+				let waker = Waker::noop();
+				let mut cx = Context::from_waker(&waker);
+
+				match tx.poll_ready(&mut cx) {
+					Poll::Ready(Ok(())) => true,
+					Poll::Ready(Err(_)) => false, // Connection error
+					Poll::Pending => false, // At stream limit
+				}
+			},
+		}
+	}
+
 	fn is_http1(&self) -> bool {
 		!self.is_http2()
 	}
@@ -860,6 +884,19 @@ where
 {
 	fn is_open(&self) -> bool {
 		!self.is_poisoned() && self.is_ready()
+	}
+
+	/// Check if the connection is open and has capacity for new streams.
+	/// For HTTP/2, this includes checking stream limits via poll_ready().
+	fn is_open_with_capacity(&mut self) -> bool {
+		if self.is_poisoned() {
+			return false;
+		}
+		#[cfg(feature = "http2")]
+		if self.is_http2() {
+			return self.has_capacity();
+		}
+		self.is_ready()
 	}
 
 	fn reserve(self) -> pool::Reservation<Self> {
