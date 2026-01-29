@@ -1,0 +1,83 @@
+// This file documents the changes needed for client.rs for v5 patch
+// Changes to add H2 checkout counter for proper backpressure
+
+// 1. Add imports at top of file (after existing imports):
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+// 2. Modify PoolClient struct (around line 770):
+struct PoolClient<B> {
+    conn_info: Connected,
+    tx: PoolTx<B>,
+    // Counter for outstanding HTTP/2 checkouts (shared between clones)
+    #[cfg(feature = "http2")]
+    h2_checkout_count: Option<Arc<AtomicUsize>>,
+}
+
+// 3. Update has_capacity() method (around line 801):
+fn has_capacity(&mut self) -> bool {
+    match self.tx {
+        #[cfg(feature = "http1")]
+        PoolTx::Http1(_) => true,
+        #[cfg(feature = "http2")]
+        PoolTx::Http2(ref mut tx) => {
+            // First check outstanding checkouts counter
+            const MAX_H2_CONCURRENT_CHECKOUTS: usize = 100;
+            if let Some(ref counter) = self.h2_checkout_count {
+                let current = counter.load(Ordering::SeqCst);
+                if current >= MAX_H2_CONCURRENT_CHECKOUTS {
+                    return false;
+                }
+            }
+            // Also check h2's poll_ready for stream limit
+            use std::task::{Context, Poll, Waker};
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(&waker);
+            matches!(tx.poll_ready(&mut cx), Poll::Ready(Ok(())))
+        },
+    }
+}
+
+// 4. Update reserve() method (around line 902):
+fn reserve(self) -> pool::Reservation<Self> {
+    match self.tx {
+        #[cfg(feature = "http1")]
+        PoolTx::Http1(tx) => pool::Reservation::Unique(PoolClient {
+            conn_info: self.conn_info,
+            tx: PoolTx::Http1(tx),
+            #[cfg(feature = "http2")]
+            h2_checkout_count: None,
+        }),
+        #[cfg(feature = "http2")]
+        PoolTx::Http2(tx) => {
+            // Get or create the checkout counter (shared between clones)
+            let counter = self.h2_checkout_count
+                .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+
+            let b = PoolClient {
+                conn_info: self.conn_info.clone(),
+                tx: PoolTx::Http2(tx.clone()),
+                h2_checkout_count: Some(counter.clone()),
+            };
+            let a = PoolClient {
+                conn_info: self.conn_info,
+                tx: PoolTx::Http2(tx),
+                h2_checkout_count: Some(counter),
+            };
+            pool::Reservation::Shared(a, b)
+        },
+    }
+}
+
+// 5. Add checkout_counter() method to Poolable impl (around line 924):
+fn checkout_counter(&self) -> Option<Arc<AtomicUsize>> {
+    #[cfg(feature = "http2")]
+    {
+        self.h2_checkout_count.clone()
+    }
+    #[cfg(not(feature = "http2"))]
+    {
+        None
+    }
+}
+
+// 6. Need to update all places that create PoolClient to include the new field
