@@ -926,7 +926,6 @@ async fn convert(
 				client.clone(),
 				idx,
 				l,
-				Some(frontend_policies.clone()),
 				gateway.clone(),
 			)
 			.await?;
@@ -949,6 +948,12 @@ async fn convert(
 		};
 		all_binds.push(b)
 	}
+
+	// Process top-level frontend_policies targeted to the gateway.
+	// This ensures frontend_policies are applied even when binds come from XDS
+	// (where the local binds array is empty).
+	let gateway_level_policies = split_frontend_policies(gateway.clone(), frontend_policies).await?;
+	all_policies.extend_from_slice(&gateway_level_policies);
 
 	for p in policies {
 		let res = split_policies(client.clone(), p.policy).await?;
@@ -1020,7 +1025,6 @@ async fn convert_listener(
 	client: client::Client,
 	idx: usize,
 	l: LocalListener,
-	frontend_policies: Option<LocalFrontendPolicies>,
 	gateway: ListenerTarget,
 ) -> anyhow::Result<(Listener, Vec<TargetedPolicy>, Vec<BackendWithPolicies>)> {
 	let LocalListener {
@@ -1079,15 +1083,10 @@ async fn convert_listener(
 	let mut all_policies = vec![];
 	let mut all_backends = vec![];
 
-	// Add frontend policies targeted to this listener
-	if let Some(frontend_pols) = frontend_policies {
-		let listener_target = ListenerTarget {
-			gateway_name: gateway_name.clone(),
-			gateway_namespace: gateway_namespace.clone(),
-			listener_name: None,
-		};
-		all_policies.extend_from_slice(&split_frontend_policies(listener_target, frontend_pols).await?);
-	}
+	// NOTE: Frontend policies are now processed at the gateway level in convert(),
+	// not here. This ensures they're processed even when there are no local binds
+	// (e.g., in XDS mode where binds come from XDS but frontend policies come from
+	// local config via rawConfig).
 
 	let mut rs = RouteSet::default();
 	for (idx, l) in routes.into_iter().flatten().enumerate() {
