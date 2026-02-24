@@ -148,6 +148,12 @@ pub struct BackendConfig {
 	/// If unset, there is no limit
 	#[serde(default)]
 	pool_max_size: Option<usize>,
+	#[serde(default = "defaults::pool_max_h2_streams_per_conn")]
+	pool_max_h2_streams_per_conn: usize,
+	#[serde(default = "defaults::pool_max_idle_h2_connections")]
+	pool_max_idle_h2_connections: usize,
+	#[serde(default = "defaults::pool_max_h2_connecting")]
+	pool_max_h2_connecting: usize,
 }
 
 impl Default for BackendConfig {
@@ -157,6 +163,9 @@ impl Default for BackendConfig {
 			connect_timeout: defaults::connect_timeout(),
 			pool_idle_timeout: defaults::pool_idle_timeout(),
 			pool_max_size: None,
+			pool_max_h2_streams_per_conn: defaults::pool_max_h2_streams_per_conn(),
+			pool_max_idle_h2_connections: defaults::pool_max_idle_h2_connections(),
+			pool_max_h2_connecting: defaults::pool_max_h2_connecting(),
 		}
 	}
 }
@@ -170,6 +179,10 @@ mod defaults {
 	pub fn pool_idle_timeout() -> Duration {
 		Duration::from_secs(90)
 	}
+
+	pub fn pool_max_h2_streams_per_conn() -> usize { 100 }
+	pub fn pool_max_idle_h2_connections() -> usize { 100 }
+	pub fn pool_max_h2_connecting() -> usize { 64 }
 
 	pub fn max_buffer_size() -> usize {
 		2_097_152

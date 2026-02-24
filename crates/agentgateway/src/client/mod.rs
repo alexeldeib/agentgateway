@@ -350,6 +350,9 @@ impl Client {
 		b.pool_timer(hyper_util::rt::tokio::TokioTimer::new());
 		b.pool_idle_timeout(backend_config.pool_idle_timeout);
 		b.timer(hyper_util::rt::tokio::TokioTimer::new());
+		b.pool_max_h2_streams_per_conn(backend_config.pool_max_h2_streams_per_conn);
+		b.pool_max_idle_h2_connections(backend_config.pool_max_idle_h2_connections);
+		b.pool_max_h2_connecting(backend_config.pool_max_h2_connecting);
 		if let Some(pool_max) = backend_config.pool_max_size {
 			b.pool_max_idle_per_host(pool_max);
 		};

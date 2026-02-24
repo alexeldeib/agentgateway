@@ -8,6 +8,8 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{self, Poll};
 use std::time::Duration;
 
@@ -332,7 +334,7 @@ where
 		// for a new request to start.
 		//
 		// It won't be ready if there is a body to stream.
-		if pooled.is_http2() || !pooled.is_pool_enabled() || pooled.is_ready() {
+		if !pooled.is_pool_enabled() || pooled.is_ready() {
 			drop(pooled);
 		} else if !res.body().is_end_stream() {
 			// let (delayed_tx, delayed_rx) = oneshot::channel::<()>();
@@ -659,11 +661,23 @@ where
 								}
 							};
 
+							let h2_checkout_state = match &tx {
+								#[cfg(feature = "http2")]
+								PoolTx::Http2(_) => Some(Arc::new(H2CheckoutState {
+									counter: Arc::new(AtomicUsize::new(0)),
+									max_streams: pool.max_h2_streams_per_conn(),
+								})),
+								#[cfg(feature = "http1")]
+								PoolTx::Http1(_) => None,
+							};
+
 							Ok(pool.pooled(
 								connecting,
 								PoolClient {
 									conn_info: connected,
 									tx,
+									#[cfg(feature = "http2")]
+									h2_checkout_state,
 								},
 							))
 						}))
@@ -764,10 +778,19 @@ impl Future for ResponseFuture {
 // ===== impl PoolClient =====
 
 // FIXME: allow() required due to `impl Trait` leaking types to this lint
+#[cfg(feature = "http2")]
+#[allow(missing_debug_implementations)]
+struct H2CheckoutState {
+	counter: Arc<AtomicUsize>,
+	max_streams: usize,
+}
+
 #[allow(missing_debug_implementations)]
 struct PoolClient<B> {
 	conn_info: Connected,
 	tx: PoolTx<B>,
+	#[cfg(feature = "http2")]
+	h2_checkout_state: Option<Arc<H2CheckoutState>>,
 }
 
 enum PoolTx<B> {
@@ -780,13 +803,13 @@ enum PoolTx<B> {
 impl<B> PoolClient<B> {
 	fn poll_ready(
 		&mut self,
-		#[allow(unused_variables)] cx: &mut task::Context<'_>,
+		cx: &mut task::Context<'_>,
 	) -> Poll<Result<(), Error>> {
 		match self.tx {
 			#[cfg(feature = "http1")]
 			PoolTx::Http1(ref mut tx) => tx.poll_ready(cx).map_err(Error::closed),
 			#[cfg(feature = "http2")]
-			PoolTx::Http2(_) => Poll::Ready(Ok(())),
+			PoolTx::Http2(ref mut tx) => tx.poll_ready(cx).map_err(Error::closed),
 		}
 	}
 
@@ -863,16 +886,23 @@ where
 			PoolTx::Http1(tx) => pool::Reservation::Unique(PoolClient {
 				conn_info: self.conn_info,
 				tx: PoolTx::Http1(tx),
+				#[cfg(feature = "http2")]
+				h2_checkout_state: None,
 			}),
 			#[cfg(feature = "http2")]
 			PoolTx::Http2(tx) => {
+				let state = self.h2_checkout_state
+					.expect("HTTP/2 PoolClient missing h2_checkout_state");
+
 				let b = PoolClient {
 					conn_info: self.conn_info.clone(),
 					tx: PoolTx::Http2(tx.clone()),
+					h2_checkout_state: Some(state.clone()),
 				};
 				let a = PoolClient {
 					conn_info: self.conn_info,
 					tx: PoolTx::Http2(tx),
+					h2_checkout_state: Some(state),
 				};
 				pool::Reservation::Shared(a, b)
 			},
@@ -881,6 +911,18 @@ where
 
 	fn can_share(&self) -> bool {
 		self.is_http2()
+	}
+
+	fn is_at_capacity(&self) -> bool {
+		if let Some(ref state) = self.h2_checkout_state {
+			state.counter.load(Ordering::Relaxed) >= state.max_streams
+		} else {
+			false
+		}
+	}
+
+	fn checkout_counter(&self) -> Option<Arc<AtomicUsize>> {
+		self.h2_checkout_state.as_ref().map(|state| state.counter.clone())
 	}
 }
 
@@ -1007,6 +1049,9 @@ impl Builder {
 			pool_config: pool::Config {
 				idle_timeout: Some(Duration::from_secs(90)),
 				max_idle_per_host: usize::MAX,
+				max_h2_streams_per_conn: 100,
+				max_idle_h2_connections: 100,
+				max_h2_connecting: 64,
 			},
 			pool_timer: None,
 		}
@@ -1056,6 +1101,30 @@ impl Builder {
 	/// Default is `usize::MAX` (no limit).
 	pub fn pool_max_idle_per_host(&mut self, max_idle: usize) -> &mut Self {
 		self.pool_config.max_idle_per_host = max_idle;
+		self
+	}
+
+	/// Sets the maximum concurrent HTTP/2 streams per connection.
+	///
+	/// Default is `100`.
+	pub fn pool_max_h2_streams_per_conn(&mut self, max: usize) -> &mut Self {
+		self.pool_config.max_h2_streams_per_conn = max;
+		self
+	}
+
+	/// Sets the maximum idle HTTP/2 connections per pool key.
+	///
+	/// Default is `100`.
+	pub fn pool_max_idle_h2_connections(&mut self, max: usize) -> &mut Self {
+		self.pool_config.max_idle_h2_connections = max;
+		self
+	}
+
+	/// Sets the maximum concurrent HTTP/2 connection establishments per key.
+	///
+	/// Default is `64`.
+	pub fn pool_max_h2_connecting(&mut self, max: usize) -> &mut Self {
+		self.pool_config.max_h2_connecting = max;
 		self
 	}
 
