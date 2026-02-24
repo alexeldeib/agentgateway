@@ -878,6 +878,14 @@ pub fn auto_server(c: Option<&frontend::HTTP>) -> auto::Builder<::hyper_util::rt
 	if let Some(m) = http2_frame_size {
 		b.http2().max_frame_size(*m);
 	}
+	// Allow overriding max concurrent streams via env var for deployments
+	// where the config is managed by XDS and not plumbed through yet.
+	// Hyper default is 200; set higher for high-throughput inference workloads.
+	if let Ok(val) = std::env::var("AGW_HTTP2_MAX_CONCURRENT_STREAMS") {
+		if let Ok(max) = val.parse::<u32>() {
+			b.http2().max_concurrent_streams(max);
+		}
+	}
 
 	b
 }
